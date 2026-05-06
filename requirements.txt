@@ -1,0 +1,28 @@
+# Anthropic Claude API
+anthropic
+
+# Data analysis
+pandas
+numpy
+
+# PDF generation (WeasyPrint = HTML/CSS to PDF)
+weasyprint
+reportlab
+Pillow
+matplotlib
+
+# Environment / config
+python-dotenv
+
+# HTTP requests
+requests
+
+# Scheduling (optional: run reports on a schedule)
+schedule
+
+# Excel support (if clients share data via spreadsheet)
+openpyxl
+
+# QuickBooks Online API — add when building QB integration
+# intuitlib
+# python-quickbooks

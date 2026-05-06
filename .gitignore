@@ -1,0 +1,47 @@
+# =============================================================
+# FINANCIAL REPORTS .gitignore
+# Files listed here are NEVER uploaded to GitHub.
+# =============================================================
+
+# ── SECRET KEYS — never, ever commit these ───────────────────
+.env
+
+# ── CLIENT DATA — real financial info and OAuth tokens ───────
+# SQLite database (has QB refresh tokens + client emails)
+clients.db
+# QuickBooks OAuth tokens — treat like passwords
+clients/tokens/
+# Client JSON profiles (have emails and QB company IDs)
+clients/*.json
+# Raw and processed financial data from QuickBooks
+data/raw/
+data/processed/
+
+# ── GENERATED REPORTS — PDFs with client financial data ──────
+reports/
+!reports/.gitkeep
+
+# ── PYTHON INTERNALS — not needed on GitHub ──────────────────
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ── LOGS — can contain client names and error details ────────
+logs/
+!logs/.gitkeep
+
+# ── TOOL AND OS FILES ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+# Claude Code project settings (local to your machine)
+.claude/
