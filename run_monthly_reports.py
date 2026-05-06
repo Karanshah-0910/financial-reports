@@ -253,6 +253,29 @@ def _run_client(client: dict, force_sample: bool,
     log.info(f"    Cash Flow    : {cf_status}  |  "
              f"Runway: {cf_analysis['cash_runway_months']} months")
 
+    # ── Step 2b: Quality control check ─────────────────────────────────────
+    log.info("    [2b] Running QC anomaly check...")
+    from anomaly_check import run_qc, save_qc_report, _render_report
+    qc_result  = run_qc(client_id, analysis, bs_analysis, cf_analysis)
+    qc_path    = save_qc_report(qc_result)
+
+    if qc_result.criticals:
+        log.error(f"    QC BLOCKED: {len(qc_result.criticals)} critical issue(s)")
+        for f in qc_result.criticals:
+            log.error(f"      {f.category}: {f.message}")
+        log.error(f"    QC report: {qc_path}")
+        raise RuntimeError(
+            f"QC check BLOCKED this report — {len(qc_result.criticals)} critical "
+            f"issue(s) found. Review {qc_path.name} before proceeding."
+        )
+    elif qc_result.warnings:
+        log.warning(f"    QC REVIEW: {len(qc_result.warnings)} warning(s) — check QC report")
+        for f in qc_result.warnings:
+            log.warning(f"      {f.category}: {f.message}")
+        log.warning(f"    QC report: {qc_path}")
+    else:
+        log.info(f"    QC PASS: all {qc_result.checks_run} checks clean")
+
     # ── Step 3: Claude insights ─────────────────────────────────────────────
     log.info("    [3/4] Generating Claude insights (10-15 sec)...")
     t0 = time.time()
@@ -286,6 +309,9 @@ def _run_client(client: dict, force_sample: bool,
         "client_id":    client_id,
         "business":     name,
         "status":       "success",
+        "qc_verdict":   qc_result.verdict,
+        "qc_warnings":  len(qc_result.warnings),
+        "qc_path":      str(qc_path),
         "pdf_path":     abs_path,
         "data_source":  data_source,
         "period":       latest,
