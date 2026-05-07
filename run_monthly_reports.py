@@ -4,28 +4,30 @@ run_monthly_reports.py
 Master orchestration script. Runs the full reporting pipeline for every
 active client in clients.db, then emails YOU a batch summary.
 
-Reports are saved for your review — they are NEVER auto-sent to clients.
-
 HOW TO RUN:
   python run_monthly_reports.py                   # All active clients
   python run_monthly_reports.py --dry-run         # Preview only — no reports built
   python run_monthly_reports.py --client riverside_home_goods  # One client only
   python run_monthly_reports.py --sample          # Force sample data (skip QB pull)
-  python run_monthly_reports.py --no-email        # Skip the summary email to you
+  python run_monthly_reports.py --no-email        # Skip ALL emails (owner + clients)
+  python run_monthly_reports.py --send-clients    # Also email each client their PDF
 
 PIPELINE PER CLIENT:
   1. Load client profile from clients.db
   2. Pull P&L (3-month), Balance Sheet, Cash Flow from QuickBooks
      (falls back to sample data if QB is not connected)
   3. Run all three analyses (P&L, balance sheet, cash flow)
-  4. Generate Claude AI insights
-  5. Build PDF report
-  6. Save to reports/{ClientName}/{YYYY-MM}_financial_report.pdf
+  4. QC anomaly check — blocks report if critical issues found
+  5. Generate Claude AI insights
+  6. Build PDF report
+  7. Save to reports/{ClientName}/{YYYY-MM}_financial_report.pdf
+  8. If --send-clients: email PDF to client's contact_email
 
 OUTPUT:
   - PDF reports in reports/{ClientName}/
   - Log file in logs/{YYYY-MM-DD_HH-MM}_batch.log
   - Summary email to SMTP_USER when batch completes
+  - Client emails with PDF attached (only with --send-clients)
 """
 
 import sys
@@ -192,7 +194,8 @@ def _pull_financial_data(client: dict, force_sample: bool,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_client(client: dict, force_sample: bool,
-                dry_run: bool, log: logging.Logger) -> dict:
+                dry_run: bool, send_clients: bool,
+                log: logging.Logger) -> dict:
     """
     Run the full pipeline for one client.
     Returns a result dict (used in the summary).
@@ -207,15 +210,18 @@ def _run_client(client: dict, force_sample: bool,
 
     if dry_run:
         log.info(f"    [DRY RUN] Would pull data, analyze, and build PDF.")
-        log.info(f"    [DRY RUN] QB connected: {bool(client.get('qbo_company_id'))}")
+        log.info(f"    [DRY RUN] QB connected   : {bool(client.get('qbo_company_id'))}")
+        log.info(f"    [DRY RUN] Client email   : {client.get('contact_email', 'not set')}")
+        log.info(f"    [DRY RUN] Would email client: {'Yes' if send_clients else 'No'}")
         return {
-            "client_id":    client_id,
-            "business":     name,
-            "status":       "dry_run",
-            "pdf_path":     None,
-            "data_source":  "n/a",
-            "duration_sec": round(time.time() - started, 1),
-            "error":        None,
+            "client_id":      client_id,
+            "business":       name,
+            "status":         "dry_run",
+            "pdf_path":       None,
+            "data_source":    "n/a",
+            "client_emailed": False,
+            "duration_sec":   round(time.time() - started, 1),
+            "error":          None,
         }
 
     # ── Step 1: Pull financial data ─────────────────────────────────────────
@@ -302,25 +308,137 @@ def _run_client(client: dict, force_sample: bool,
     log.info(f"    PDF saved      : {abs_path}")
     log.info(f"    PDF size       : {size_kb:.0f} KB  ({time.time()-t0:.1f}s)")
 
+    result = {
+        "client_id":      client_id,
+        "business":       name,
+        "status":         "success",
+        "qc_verdict":     qc_result.verdict,
+        "qc_warnings":    len(qc_result.warnings),
+        "qc_path":        str(qc_path),
+        "pdf_path":       abs_path,
+        "data_source":    data_source,
+        "period":         latest,
+        "revenue":        monthly_rev,
+        "net_profit":     net_profit,
+        "net_margin":     net_margin,
+        "client_emailed": False,
+        "error":          None,
+    }
+
+    # ── Step 5: Generate client HTML dashboard ──────────────────────────────
+    try:
+        from generate_client_dashboard import _render, _save, _parse_insights
+        log.info("    [5/5] Building client HTML dashboard...")
+        insights_raw = insights if isinstance(insights, str) else ""
+        dash_html    = _render(client, analysis, bs_analysis, cf_analysis, insights_raw)
+        dash_path    = _save(client, analysis, dash_html)
+        result["dashboard_path"] = str(dash_path)
+        log.info(f"    Dashboard saved: {dash_path.name}")
+    except Exception as e:
+        log.warning(f"    Dashboard skipped: {e}")
+        result["dashboard_path"] = None
+
+    # ── Step 6: Email report to client (only if --send-clients) ────────────
+    if send_clients:
+        log.info("    [6/6] Emailing report to client...")
+        _send_client_report(client, result, log)
+        result["client_emailed"] = True
+
     duration = round(time.time() - started, 1)
     log.info(f"    Total time     : {duration}s")
+    result["duration_sec"] = duration
 
-    return {
-        "client_id":    client_id,
-        "business":     name,
-        "status":       "success",
-        "qc_verdict":   qc_result.verdict,
-        "qc_warnings":  len(qc_result.warnings),
-        "qc_path":      str(qc_path),
-        "pdf_path":     abs_path,
-        "data_source":  data_source,
-        "period":       latest,
-        "revenue":      monthly_rev,
-        "net_profit":   net_profit,
-        "net_margin":   net_margin,
-        "duration_sec": duration,
-        "error":        None,
-    }
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLIENT EMAIL — send the PDF report to the individual client
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _send_client_report(client: dict, result: dict, log: logging.Logger):
+    """
+    Email the client their PDF report for the month.
+    Uses the client's contact_email from clients.db.
+    Called only when --send-clients flag is set.
+    """
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_pass = os.getenv("SMTP_PASSWORD", "").strip()
+    company   = os.getenv("COMPANY_NAME",  "Shah Consultant").strip()
+    author    = os.getenv("REPORT_AUTHOR", "").strip()
+
+    if not smtp_user or not smtp_pass:
+        log.warning("    Client email skipped — SMTP credentials not set in .env")
+        return
+
+    to_email = (client.get("contact_email") or "").strip()
+    if not to_email:
+        log.warning(f"    Client email skipped — no contact_email for {client['business_name']}")
+        return
+
+    pdf_path = result.get("pdf_path")
+    if not pdf_path or not pathlib.Path(pdf_path).exists():
+        log.warning(f"    Client email skipped — PDF not found at {pdf_path}")
+        return
+
+    period        = result.get("period", "this month")
+    business_name = client["business_name"]
+
+    # ── Subject and body ──────────────────────────────────────────────────
+    subject = f"Your Financial Report — {period} | {business_name}"
+
+    # Friendly name: first word of business name, or "there"
+    first_name = business_name.split()[0] if business_name else "there"
+
+    body_lines = [
+        f"Hi {first_name},",
+        "",
+        f"Please find attached your financial report for {period}.",
+        "",
+        "This report includes:",
+        "  - Profit & Loss summary with month-over-month comparison",
+        "  - Balance sheet highlights and liquidity ratios",
+        "  - Cash flow analysis and runway estimate",
+        "  - AI-generated insights and key items to watch",
+        "",
+        "If you have any questions or would like to discuss the numbers,",
+        "please don't hesitate to reach out — happy to schedule a call.",
+        "",
+        "Best regards,",
+    ]
+
+    if author:
+        body_lines.append(author)
+    body_lines.append(company)
+
+    body = "\n".join(body_lines)
+
+    # ── Build email ───────────────────────────────────────────────────────
+    msg = EmailMessage()
+    msg["From"]    = smtp_user
+    msg["To"]      = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    # Attach PDF
+    pdf_bytes = pathlib.Path(pdf_path).read_bytes()
+    pdf_name  = pathlib.Path(pdf_path).name
+    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf",
+                       filename=pdf_name)
+
+    # ── Send ──────────────────────────────────────────────────────────────
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        log.info(f"    Client email sent  : {to_email}")
+    except smtplib.SMTPAuthenticationError:
+        log.error("    Client email FAILED: Authentication error. Check SMTP credentials in .env")
+    except Exception as e:
+        log.error(f"    Client email FAILED: {e}")
+        log.debug(traceback.format_exc())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -328,11 +446,12 @@ def _run_client(client: dict, force_sample: bool,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _send_summary_email(results: list[dict], log_path: pathlib.Path,
-                        total_sec: int, log: logging.Logger):
+                        total_sec: int, log: logging.Logger,
+                        send_clients: bool = False):
     """
     Email the batch summary to SMTP_USER (you).
     Attaches the full log file.
-    Never sends to clients.
+    Never sends to clients — that's handled by _send_client_report().
     """
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.getenv("SMTP_PORT", 587))
@@ -395,9 +514,9 @@ def _send_summary_email(results: list[dict], log_path: pathlib.Path,
         "-" * 60,
         "Full log file is attached.",
         "",
-        "NEXT STEP: Review the PDFs above, then send to clients manually.",
+        f"{'Clients were emailed their reports automatically.' if send_clients else 'NEXT STEP: Review the PDFs above, then send to clients manually.'}",
         "",
-        "Shah Consultant — Automated Reporting System",
+        f"{os.getenv('COMPANY_NAME', 'Shah Consultant')} — Automated Reporting System",
     ]
 
     body = "\n".join(lines)
@@ -439,9 +558,10 @@ def _send_summary_email(results: list[dict], log_path: pathlib.Path,
 
 def main():
     args         = sys.argv[1:]
-    dry_run      = "--dry-run"    in args
-    no_email     = "--no-email"   in args
-    force_sample = "--sample"     in args
+    dry_run      = "--dry-run"      in args
+    no_email     = "--no-email"     in args
+    force_sample = "--sample"       in args
+    send_clients = "--send-clients" in args
     client_arg   = next((args[i+1] for i, a in enumerate(args)
                          if a == "--client" and i+1 < len(args)), None)
 
@@ -451,11 +571,12 @@ def main():
     # ── Header ──────────────────────────────────────────────────────────────
     log.info("=" * 62)
     log.info("  MONTHLY REPORT BATCH")
-    log.info(f"  Started  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info(f"  Dry run  : {'YES — no reports will be built' if dry_run else 'No'}")
-    log.info(f"  Data     : {'Forced sample data' if force_sample else 'QuickBooks (sample fallback)'}")
-    log.info(f"  Email    : {'disabled' if no_email else 'summary to you when done'}")
-    log.info(f"  Log file : {log_path}")
+    log.info(f"  Started      : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"  Dry run      : {'YES — no reports will be built' if dry_run else 'No'}")
+    log.info(f"  Data         : {'Forced sample data' if force_sample else 'QuickBooks (sample fallback)'}")
+    log.info(f"  Client emails: {'YES — PDF will be sent to each client' if send_clients else 'No (use --send-clients to enable)'}")
+    log.info(f"  Owner email  : {'disabled' if no_email else 'summary to you when done'}")
+    log.info(f"  Log file     : {log_path}")
     log.info("=" * 62)
 
     # ── Load clients ─────────────────────────────────────────────────────────
@@ -481,7 +602,7 @@ def main():
     for i, client in enumerate(clients, 1):
         log.info(f"\n[{i}/{len(clients)}]")
         try:
-            result = _run_client(client, force_sample, dry_run, log)
+            result = _run_client(client, force_sample, dry_run, send_clients, log)
             results.append(result)
         except Exception as e:
             log.error(f"\n  !! FAILED: {client['business_name']}")
@@ -513,9 +634,10 @@ def main():
     log.info(f"{'=' * 62}")
 
     if successes:
-        log.info("\nReports saved (ready for your review):")
+        log.info("\nReports saved:")
         for r in successes:
-            log.info(f"  OK   {r['business']}")
+            emailed = "  [client emailed]" if r.get("client_emailed") else "  [not sent to client]"
+            log.info(f"  OK   {r['business']}{emailed}")
             log.info(f"       {r['pdf_path']}")
 
     if failures:
@@ -529,7 +651,7 @@ def main():
     # ── Send summary email to you ─────────────────────────────────────────────
     if not no_email and not dry_run:
         log.info("\nSending batch summary email to you...")
-        _send_summary_email(results, log_path, total_sec, log)
+        _send_summary_email(results, log_path, total_sec, log, send_clients=send_clients)
     elif dry_run:
         log.info("\n[DRY RUN] Summary email skipped.")
     else:

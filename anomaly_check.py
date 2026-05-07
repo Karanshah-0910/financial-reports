@@ -451,13 +451,20 @@ def check_cash_flow(result: QCResult, cf_analysis: dict):
     runway = cf_analysis.get("cash_runway_months",  0) or 0
     burn   = cf_analysis.get("monthly_burn_rate",   0) or 0
 
-    # -- Cash runway under 2 months = emergency
-    if 0 < runway < 2:
+    # -- Cash runway under 1 month = emergency (CRITICAL — blocks report)
+    if 0 < runway < 1:
         result.add(CRITICAL, "Cash Flow",
                    f"Cash runway is {runway:.1f} months. "
                    f"This needs to be addressed in the report.",
                    value=f"{runway:.1f} months",
                    context="Client may not be able to cover next month's payroll.")
+
+    # -- Cash runway 1-2 months = serious but not a blocker (WARNING)
+    elif 1 <= runway < 2:
+        result.add(WARNING, "Cash Flow",
+                   f"Cash runway is {runway:.1f} months — under 2 months.",
+                   value=f"{runway:.1f} months",
+                   context="Flag this in the report and recommend building cash reserves.")
 
     # -- Burn rate check
     if burn > 0 and ocf < 0:

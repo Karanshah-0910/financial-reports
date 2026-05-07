@@ -15,13 +15,216 @@ clients back-to-back, Anthropic only bills the system prompt once.
 """
 
 import os
+import json
 import pathlib
+import datetime
 import anthropic
 from dotenv import load_dotenv
 
 # Load .env from the project root (two levels up from this file: src/claude_insights/ → project root)
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
+
+_EXAMPLES_DIR = _PROJECT_ROOT / "insight_examples"
+
+
+# ---------------------------------------------------------------------------
+# Example library — auto-capture and few-shot retrieval
+# ---------------------------------------------------------------------------
+
+def _next_example_id() -> str:
+    """Return the next padded example number: '001', '002', etc."""
+    _EXAMPLES_DIR.mkdir(exist_ok=True)
+    existing = [
+        d for d in _EXAMPLES_DIR.iterdir()
+        if d.is_dir() and d.name[0].isdigit()
+    ]
+    return f"{len(existing) + 1:03d}"
+
+
+def _save_example_draft(example_id: str, client_id: str, period: str,
+                         data_block: str, draft: str,
+                         industry: str = "", revenue: float = 0,
+                         margin: float = 0) -> pathlib.Path:
+    """
+    Auto-save input + draft after every Claude call.
+    Creates the folder and files silently — no user action needed.
+    final.txt is only created when the user runs refine_insight.py.
+    """
+    safe_client = (client_id or "unknown").replace(" ", "_")
+    try:
+        ym = datetime.datetime.strptime(period, "%B %Y").strftime("%Y-%m")
+    except Exception:
+        ym = period.replace(" ", "-")
+
+    folder_name = f"{example_id}_{safe_client}_{ym}"
+    folder = _EXAMPLES_DIR / folder_name
+    folder.mkdir(exist_ok=True)
+
+    # input.json — the financial summary sent to Claude
+    (folder / "input.json").write_text(
+        json.dumps({
+            "client_id": client_id,
+            "period":    period,
+            "data":      data_block,
+        }, indent=2),
+        encoding="utf-8"
+    )
+
+    # draft.txt — Claude's raw first response
+    (folder / "draft.txt").write_text(draft, encoding="utf-8")
+
+    # metadata.json — used for smart example selection
+    (folder / "metadata.json").write_text(
+        json.dumps({
+            "example_id":   example_id,
+            "client_id":    client_id,
+            "period":       period,
+            "industry":     industry,
+            "revenue":      revenue,
+            "net_margin":   margin,
+            "has_final":    False,
+            "captured_at":  datetime.datetime.now().isoformat(),
+        }, indent=2),
+        encoding="utf-8"
+    )
+
+    return folder
+
+
+def _load_examples(current_industry: str = "",
+                   current_revenue: float = 0,
+                   current_margin: float = 0,
+                   max_examples: int = 3) -> list[dict]:
+    """
+    Load the best matching complete examples (those with a final.txt).
+
+    Scoring logic (higher = more relevant):
+      +3  exact industry match
+      +1  revenue within 2x
+      +1  margin within 10 percentage points
+      +0.5 per 10 examples of recency bias (newer = slightly preferred)
+
+    Returns a list of dicts: [{input, draft, final, metadata}, ...]
+    Sorted best-match first.
+    """
+    if not _EXAMPLES_DIR.exists():
+        return []
+
+    scored = []
+    for folder in sorted(_EXAMPLES_DIR.iterdir()):
+        if not folder.is_dir() or not folder.name[0].isdigit():
+            continue
+
+        final_path = folder / "final.txt"
+        input_path = folder / "input.json"
+        meta_path  = folder / "metadata.json"
+
+        if not final_path.exists() or not input_path.exists():
+            continue    # Skip examples without a final edit
+
+        try:
+            meta  = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            inp   = json.loads(input_path.read_text(encoding="utf-8"))
+            final = final_path.read_text(encoding="utf-8").strip()
+            draft = (folder / "draft.txt").read_text(encoding="utf-8").strip() \
+                    if (folder / "draft.txt").exists() else ""
+
+            if not final:
+                continue
+
+            # Score relevance
+            score = 0.0
+            ex_industry = meta.get("industry", "").lower()
+            ex_revenue  = float(meta.get("revenue",    0) or 0)
+            ex_margin   = float(meta.get("net_margin", 0) or 0)
+            ex_id       = int(meta.get("example_id", "0") or 0)
+
+            if current_industry and ex_industry:
+                if current_industry.lower() == ex_industry.lower():
+                    score += 3
+                elif any(w in ex_industry for w in current_industry.lower().split()):
+                    score += 1
+
+            if current_revenue > 0 and ex_revenue > 0:
+                ratio = max(current_revenue, ex_revenue) / min(current_revenue, ex_revenue)
+                if ratio <= 2:
+                    score += 1
+
+            if abs(current_margin - ex_margin) <= 10:
+                score += 1
+
+            # Slight recency bonus
+            score += ex_id * 0.05
+
+            scored.append((score, {
+                "input":    inp.get("data", ""),
+                "period":   inp.get("period", ""),
+                "draft":    draft,
+                "final":    final,
+                "metadata": meta,
+            }))
+
+        except Exception:
+            continue
+
+    # Sort by score descending, return top N
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [ex for _, ex in scored[:max_examples]]
+
+
+def _build_fewshot_block(examples: list[dict]) -> str:
+    """
+    Format examples as a few-shot block to inject into the prompt.
+    Each example shows: what the data looked like → what good output looks like.
+    """
+    if not examples:
+        return ""
+
+    lines = [
+        "EXAMPLES OF THE EXACT VOICE AND STYLE EXPECTED",
+        "=" * 56,
+        "Study these carefully. Your output should match this "
+        "analytical style, level of directness, and phrasing.",
+        "",
+    ]
+
+    for i, ex in enumerate(examples, 1):
+        meta   = ex.get("metadata", {})
+        period = ex.get("period", "")
+        ind    = meta.get("industry", "")
+        rev    = meta.get("revenue", 0)
+        margin = meta.get("net_margin", 0)
+
+        context_parts = []
+        if period:   context_parts.append(period)
+        if ind:      context_parts.append(ind)
+        if rev:      context_parts.append(f"~${float(rev):,.0f} revenue")
+        if margin:   context_parts.append(f"{float(margin):.1f}% margin")
+        context_str = "  |  ".join(context_parts)
+
+        lines += [
+            f"--- EXAMPLE {i} ---",
+            f"Context: {context_str}" if context_str else f"--- EXAMPLE {i} ---",
+            "",
+            "OUTPUT (this is the style, voice, and quality to match):",
+            ex["final"],
+            "",
+        ]
+
+    lines += ["=" * 56, ""]
+    return "\n".join(lines)
+
+
+def _count_complete_examples() -> int:
+    """Return number of examples that have both draft and final."""
+    if not _EXAMPLES_DIR.exists():
+        return 0
+    count = 0
+    for folder in _EXAMPLES_DIR.iterdir():
+        if folder.is_dir() and (folder / "final.txt").exists():
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +349,10 @@ def generate_insights(
     Send all financial data to Claude and get back a 3-section
     executive summary in the voice of a fractional CFO.
 
+    When completed examples exist in insight_examples/, the most
+    relevant ones are injected as few-shot examples so Claude
+    matches your voice and analytical style progressively over time.
+
     analysis      : output of run_analysis()
     client_config : optional — adds industry context to the prompt
     bs_analysis   : optional — output of analyze_balance_sheet()
@@ -153,11 +360,12 @@ def generate_insights(
 
     Returns a plain-text string with three labelled sections.
     """
-    client        = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    business_name = analysis["business_name"]
-    latest_month  = analysis["latest_month"]
+    anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    business_name    = analysis["business_name"]
+    latest_month     = analysis["latest_month"]
+    client_id        = analysis.get("client_id", business_name.lower().replace(" ", "_"))
 
-    # Build the data block Claude will read
+    # ── Build the financial data block ────────────────────────────────────
     data_block = _format_financials_for_claude(analysis)
 
     if bs_analysis:
@@ -168,16 +376,42 @@ def generate_insights(
         from src.analysis.cash_flow_analyzer import format_cf_for_claude
         data_block += "\n\n" + format_cf_for_claude(cf_analysis)
 
-    # Optional industry context from client config
-    industry_line = ""
+    # ── Industry and financial profile for example matching ───────────────
+    industry = ""
     if client_config:
-        ctx = client_config.get("report_preferences", {}).get("industry_context", "")
-        if ctx:
-            industry_line = f"\n\nContext: This business operates in the {ctx} sector."
+        industry = (
+            client_config.get("industry", "") or
+            client_config.get("report_preferences", {}).get("industry_context", "")
+        )
 
-    # ------------------------------------------------------------------
-    # System prompt — cached so multiple clients in one run only pay once
-    # ------------------------------------------------------------------
+    latest     = analysis["latest_month"]
+    summary_df = analysis["summary_df"]
+    try:
+        current_revenue = float(summary_df.loc["Total Revenue", latest])
+        current_margin  = float(summary_df.loc["Net Margin %",  latest])
+    except Exception:
+        current_revenue = 0
+        current_margin  = 0
+
+    # ── Load few-shot examples (requires final.txt to exist) ──────────────
+    n_complete = _count_complete_examples()
+    examples   = []
+    if n_complete >= 1:
+        examples = _load_examples(
+            current_industry = industry,
+            current_revenue  = current_revenue,
+            current_margin   = current_margin,
+            max_examples     = 3,
+        )
+
+    fewshot_block = _build_fewshot_block(examples)
+
+    # ── Industry context line ─────────────────────────────────────────────
+    industry_line = ""
+    if industry:
+        industry_line = f"\n\nContext: This business operates in the {industry} sector."
+
+    # ── System prompt — cached across the full batch run ─────────────────
     system_prompt = (
         "You are a fractional CFO writing a monthly financial briefing "
         "for a small business owner. Your job is to turn raw financial "
@@ -220,7 +454,29 @@ def generate_insights(
         f"{industry_line}"
     )
 
-    response = client.messages.create(
+    # ── User message — few-shot examples prepended when available ─────────
+    user_content_parts = []
+
+    if fewshot_block:
+        # Cache the examples block — it's stable and reused across clients
+        user_content_parts.append({
+            "type": "text",
+            "text": fewshot_block,
+            "cache_control": {"type": "ephemeral"},
+        })
+
+    user_content_parts.append({
+        "type": "text",
+        "text": (
+            f"Write the monthly briefing for {business_name}, {latest_month}."
+            + (f"\n\nMatch the voice and style of the examples above."
+               if fewshot_block else "")
+            + f"\n\n{data_block}"
+        ),
+    })
+
+    # ── API call ──────────────────────────────────────────────────────────
+    response = anthropic_client.messages.create(
         model      = "claude-sonnet-4-5",
         max_tokens = 800,
 
@@ -228,19 +484,38 @@ def generate_insights(
             {
                 "type": "text",
                 "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},   # Billed once per run
+                "cache_control": {"type": "ephemeral"},
             }
         ],
 
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    f"Write the monthly briefing for {business_name}, {latest_month}.\n\n"
-                    f"{data_block}"
-                ),
-            }
-        ],
+        messages = [{"role": "user", "content": user_content_parts}],
     )
 
-    return response.content[0].text
+    draft = response.content[0].text
+
+    # ── Auto-save input + draft for future refinement ─────────────────────
+    try:
+        example_id = _next_example_id()
+        folder = _save_example_draft(
+            example_id = example_id,
+            client_id  = client_id,
+            period     = latest_month,
+            data_block = data_block,
+            draft      = draft,
+            industry   = industry,
+            revenue    = current_revenue,
+            margin     = current_margin,
+        )
+        # Only print this if there are still uncompleted examples to review
+        pending = sum(
+            1 for f in _EXAMPLES_DIR.iterdir()
+            if f.is_dir() and (f / "draft.txt").exists()
+            and not (f / "final.txt").exists()
+        )
+        if pending <= 3:   # Don't spam the console once the library is large
+            print(f"      Example saved: {folder.name}  "
+                  f"({n_complete} complete, {pending} pending review)")
+    except Exception:
+        pass   # Never let example saving crash the report pipeline
+
+    return draft

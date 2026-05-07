@@ -46,10 +46,19 @@ build/
 logs/
 !logs/.gitkeep
 
-# ── GENERATED DASHBOARD — contains your live MRR and client list
+# ── GENERATED DASHBOARD — contains your live MRR and client list ─
 dashboard.html
 
-# ── TOOL AND OS FILES ────────────────────────────────────────
+# ── OLD / SUPERSEDED FILES — kept locally but not needed on GitHub
+portal/
+assets/
+debug_auth_url.py
+test_insights.py
+test_qbo_connection.py
+generate_all_reports.py
+generate_insights.py
+
+# ── TOOL AND OS FILES ────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
