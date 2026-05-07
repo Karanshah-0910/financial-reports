@@ -21,6 +21,16 @@ data/processed/
 reports/
 !reports/.gitkeep
 
+# ── INSIGHT EXAMPLES — contain real client financial data ────
+# input.json has raw QB numbers; draft.txt has generated commentary
+# Only README.txt and folder structure are safe to commit
+insight_examples/**/input.json
+insight_examples/**/draft.txt
+insight_examples/**/final.txt
+insight_examples/**/metadata.json
+# But keep the folder and its README visible on GitHub
+!insight_examples/README.txt
+
 # ── PYTHON INTERNALS — not needed on GitHub ──────────────────
 venv/
 .venv/
@@ -35,6 +45,9 @@ build/
 # ── LOGS — can contain client names and error details ────────
 logs/
 !logs/.gitkeep
+
+# ── GENERATED DASHBOARD — contains your live MRR and client list
+dashboard.html
 
 # ── TOOL AND OS FILES ────────────────────────────────────────
 .DS_Store
