@@ -126,7 +126,7 @@ def _pnl_chart_data(analysis: dict) -> dict:
 def _cf_bars(cf_analysis: dict) -> dict:
     return {
         "operating":  round(float(cf_analysis.get("operating_cash_flow",  0) or 0)),
-        "investing":  round(float(cf_analysis.get("investing_cash_flow",  0) or 0)),
+        "investing":  round(-float(cf_analysis.get("capex", 0) or 0)),
         "financing":  round(float(cf_analysis.get("financing_cash_flow",  0) or 0)),
     }
 
@@ -179,7 +179,7 @@ def _fmt_insight_html(text: str) -> str:
             continue
         if s.startswith(("-", "•", "*", "–")):
             if not in_ul: out.append('<ul class="insight-list">'); in_ul = True
-            out.append(f"<li>{s.lstrip('-•*– ').strip()}</li>")
+            out.append(f"<li>{s.lstrip('-•*– ').replace('**', '').strip()}</li>")
         else:
             if in_ul: out.append("</ul>"); in_ul = False
             out.append(f"<p>{s}</p>")
